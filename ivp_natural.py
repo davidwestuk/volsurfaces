@@ -49,7 +49,7 @@ from svi import (  # <-- adjust to your module name
     SVIRaw,
     forward_to_logm,
     logm_to_strike,
-    prob_below_forward,
+    prob_below_strike,
     variance_swap_strike,
 )
 
@@ -453,4 +453,4 @@ if __name__ == "__main__":
 
     # risk-neutral CDF via put spread: P(S < x% of F) on the damped IVP slice
     for frac in (0.05, 0.5, 0.9):
-        print(f"F={F}: P(S < {frac:>4.0%} of F) = {prob_below_forward(ivp_F, frac):.6f}")
+        print(f"F={F}: P(S < {frac:>4.0%} of F) = {prob_below_strike(ivp_F, frac * F):.6f}")

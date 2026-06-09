@@ -561,26 +561,6 @@ def prob_below_strike(
     return min(max(cdf, 0.0), 1.0)
 
 
-def prob_below_forward(
-    slice,
-    fraction: float,
-    *,
-    h: Optional[float] = None,
-    F: Optional[float] = None,
-) -> float:
-    """Risk-neutral probability that S_T finishes below `fraction` of the forward,
-    i.e. P(S_T < fraction * F). For example fraction=0.05 gives P(S_T < 5% of F).
-
-    Thin convenience wrapper over `prob_below_strike` at K = fraction * F.
-    """
-    F = slice.F if F is None else F
-    if F is None or F <= 0:
-        raise ValueError("A positive forward F is required (set slice.F or pass F).")
-    if fraction <= 0:
-        raise ValueError("fraction must be positive.")
-    return prob_below_strike(slice, fraction * F, h=h, F=F)
-
-
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
@@ -707,9 +687,8 @@ if __name__ == "__main__":
         print(f"P(S < {frac:>4.0%} of F) = {p_spread:.6f}  (density integral {p_density:.6f})")
         assert abs(p_spread - p_density) < 1e-3, "put-spread CDF vs density-integral mismatch"
 
-    # (b) convenience wrapper agrees, monotone, and within [0,1]
-    assert abs(prob_below_forward(slice_F, 0.05) - prob_below_strike(slice_F, 0.05 * slice_F.F)) < 1e-12
-    probs = [prob_below_forward(slice_F, f) for f in (0.05, 0.25, 0.5, 0.75, 0.95)]
+    # (b) monotone and within [0,1] across strikes
+    probs = [prob_below_strike(slice_F, f * slice_F.F) for f in (0.05, 0.25, 0.5, 0.75, 0.95)]
     assert all(0.0 <= p <= 1.0 for p in probs) and probs == sorted(probs), "CDF must be monotone in [0,1]"
 
     # (c) flat-vol slice: P(S<K) matches the closed-form N(-d2)

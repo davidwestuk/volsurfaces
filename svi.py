@@ -520,6 +520,68 @@ def variance_swap_strike(
 
 
 # --------------------------------------------------------------------------- #
+# Risk-neutral CDF via a tight put spread (digital put)
+# --------------------------------------------------------------------------- #
+def prob_below_strike(
+    slice,
+    K: float,
+    *,
+    h: Optional[float] = None,
+    F: Optional[float] = None,
+) -> float:
+    """Risk-neutral probability P(S_T < K) for a single smile slice.
+
+    A cash-or-nothing digital put (pays 1 if S_T < K) is the K -> 0 limit of a
+    tight put spread, and its undiscounted price equals the risk-neutral CDF:
+
+        P(S_T < K) = dP/dK   ~=   [ Ptilde(K+h) - Ptilde(K-h) ] / (2h),
+
+    where Ptilde is the undiscounted Black-76 put. Because each leg is priced at
+    its own point on the smile (total variance read at K +- h), the spread is
+    smile-aware: it captures the skew, unlike a flat-vol N(-d2). Model-free given
+    the implied-vol slice.
+
+    Works on any slice exposing `total_variance(k)` and `.F` (all five SVI/IVP
+    classes); the IVP classes use their realized/damped smile. `T` is not needed.
+    """
+    F = slice.F if F is None else F
+    if F is None or F <= 0:
+        raise ValueError("A positive forward F is required (set slice.F or pass F).")
+    K = float(K)
+    if K <= 0:
+        raise ValueError("Strike K must be positive.")
+    if h is None:
+        h = 1e-4 * K
+    Kp, Km = K + h, max(K - h, 1e-12)
+    wp = slice.total_variance(np.log(Kp / F))
+    wm = slice.total_variance(np.log(Km / F))
+    put_p = black_price(F, Kp, wp, "put")
+    put_m = black_price(F, Km, wm, "put")
+    cdf = float((put_p - put_m) / (Kp - Km))
+    return min(max(cdf, 0.0), 1.0)
+
+
+def prob_below_forward(
+    slice,
+    fraction: float,
+    *,
+    h: Optional[float] = None,
+    F: Optional[float] = None,
+) -> float:
+    """Risk-neutral probability that S_T finishes below `fraction` of the forward,
+    i.e. P(S_T < fraction * F). For example fraction=0.05 gives P(S_T < 5% of F).
+
+    Thin convenience wrapper over `prob_below_strike` at K = fraction * F.
+    """
+    F = slice.F if F is None else F
+    if F is None or F <= 0:
+        raise ValueError("A positive forward F is required (set slice.F or pass F).")
+    if fraction <= 0:
+        raise ValueError("fraction must be positive.")
+    return prob_below_strike(slice, fraction * F, h=h, F=F)
+
+
+# --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -634,3 +696,24 @@ if __name__ == "__main__":
     atm_vol = float(slice_F.implied_vol_strike(slice_F.F))
     print(f"K_var={kvar:.6f}  ATM vol={atm_vol:.6f}  (premium={kvar - atm_vol:+.6f})")
     assert kvar >= atm_vol, "variance-swap strike should exceed ATM vol under skew/convexity"
+
+    # 9) Risk-neutral CDF via put spread -------------------------------------
+    # (a) must match the Breeden-Litzenberger density integral int_0^K f(K') dK'
+    for frac in (0.05, 0.5, 0.9, 1.0):
+        K_lvl = frac * slice_F.F
+        p_spread = prob_below_strike(slice_F, K_lvl)
+        Kgrid = np.linspace(1e-6, K_lvl, 200001)
+        p_density = float(np.trapezoid(slice_F.risk_neutral_density_strike(Kgrid), Kgrid))
+        print(f"P(S < {frac:>4.0%} of F) = {p_spread:.6f}  (density integral {p_density:.6f})")
+        assert abs(p_spread - p_density) < 1e-3, "put-spread CDF vs density-integral mismatch"
+
+    # (b) convenience wrapper agrees, monotone, and within [0,1]
+    assert abs(prob_below_forward(slice_F, 0.05) - prob_below_strike(slice_F, 0.05 * slice_F.F)) < 1e-12
+    probs = [prob_below_forward(slice_F, f) for f in (0.05, 0.25, 0.5, 0.75, 0.95)]
+    assert all(0.0 <= p <= 1.0 for p in probs) and probs == sorted(probs), "CDF must be monotone in [0,1]"
+
+    # (c) flat-vol slice: P(S<K) matches the closed-form N(-d2)
+    p_flat = prob_below_strike(flat, flat.F)
+    d2_flat = (0.0 - 0.5 * sigma_flat**2 * T_flat) / (sigma_flat * sqrt(T_flat))
+    print(f"flat-vol P(S<F) = {p_flat:.6f}  (N(-d2) = {0.5 * erfc(d2_flat / sqrt(2.0)):.6f})")
+    assert abs(p_flat - 0.5 * erfc(d2_flat / sqrt(2.0))) < 1e-4, "flat-vol CDF must equal N(-d2)"

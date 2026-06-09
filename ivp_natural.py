@@ -49,6 +49,7 @@ from svi import (  # <-- adjust to your module name
     SVIRaw,
     forward_to_logm,
     logm_to_strike,
+    prob_below_forward,
     variance_swap_strike,
 )
 
@@ -449,3 +450,7 @@ if __name__ == "__main__":
     kvar_fine = variance_swap_strike(ivp_F, num=8001)
     print(f"F={F}: variance-swap strike K_var={kvar:.6f}  (grid-stable: {abs(kvar - kvar_fine):.2e})")
     assert kvar > 0.0 and abs(kvar - kvar_fine) < 1e-3, "IVP variance swap unstable"
+
+    # risk-neutral CDF via put spread: P(S < x% of F) on the damped IVP slice
+    for frac in (0.05, 0.5, 0.9):
+        print(f"F={F}: P(S < {frac:>4.0%} of F) = {prob_below_forward(ivp_F, frac):.6f}")

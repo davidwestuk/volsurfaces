@@ -1,0 +1,405 @@
+"""
+SVI volatility surface slice — Numerix "natural" parameterization.
+
+Implements the variant described in:
+    Konikov & Trainor, "SVI Volatility Surface", Numerix Support Papers, March 2024.
+
+Two equivalent per-maturity representations of a single SVI slice:
+
+  * SVIRaw      — the original Gatheral parameters (a, b, m, sigma, rho), eq. (2.1)
+  * SVINatural  — the paper's natural parameters (w0, w1, w2, beta_minus, beta_plus),
+                  eqs. (2.2)-(2.6), i.e. curve value/slope/curvature at k=0 and the
+                  two asymptotic wing slopes.
+
+The map is *exact* in both directions (eqs. 2.7-2.11), and is verified by round-trip
+tests in __main__.
+
+NOTE on naming. This "natural" parameterization is NOT Gatheral-Jacquier SVI-JW:
+everything here lives in TOTAL-VARIANCE space and is maturity-free per slice.
+  - w0 = w(0) is ATM *total variance*  (not ATM vol, not v_T)
+  - w1 = w'(0) is the ATM *total-variance* skew (not the v_T-normalized JW skew)
+  - w2 = w''(0) is the ATM total-variance curvature
+  - beta_minus, beta_plus are the raw asymptotic slopes lim_{k->-+inf} w(k)/k
+    (= b(rho-1) and b(rho+1)), the Lee-moment wing slopes.
+
+Dependencies: numpy + stdlib only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import copysign, sqrt
+from typing import Optional
+
+import numpy as np
+
+ArrayLike = np.ndarray
+
+
+# --------------------------------------------------------------------------- #
+# Raw (original) parameterization — eq. (2.1)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SVIRaw:
+    """Original SVI parameters for one maturity. w is TOTAL implied variance.
+
+        w(k) = a + b [ rho (k - m) + sqrt(sigma^2 + (k - m)^2) ]
+    """
+
+    a: float
+    b: float
+    m: float
+    sigma: float
+    rho: float
+    T: Optional[float] = None  # maturity, only needed for vol conversion
+
+    # -- evaluation ---------------------------------------------------------- #
+    def total_variance(self, k: ArrayLike) -> ArrayLike:
+        k = np.asarray(k, dtype=float)
+        d = k - self.m
+        return self.a + self.b * (self.rho * d + np.sqrt(self.sigma**2 + d * d))
+
+    def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        T = self.T if T is None else T
+        if T is None or T <= 0:
+            raise ValueError("A positive maturity T is required for implied_vol.")
+        return np.sqrt(self.total_variance(k) / T)
+
+    def d_dk(self, k: ArrayLike) -> ArrayLike:
+        k = np.asarray(k, dtype=float)
+        d = k - self.m
+        return self.b * (self.rho + d / np.sqrt(self.sigma**2 + d * d))
+
+    def d2_dk2(self, k: ArrayLike) -> ArrayLike:
+        k = np.asarray(k, dtype=float)
+        d = k - self.m
+        return self.b * self.sigma**2 / (self.sigma**2 + d * d) ** 1.5
+
+    # -- global minimum (vertex), Section 4.3 -------------------------------- #
+    def vertex(self) -> tuple[float, float]:
+        """Returns (k*, w(k*)) — the minimum of the smile (root of dw/dk)."""
+        r = self.rho
+        k_star = self.m - self.sigma * r / sqrt(1.0 - r * r)
+        w_star = self.a + self.b * self.sigma * sqrt(1.0 - r * r)
+        return k_star, w_star
+
+    # -- conversion to natural params, eqs. (2.2)-(2.6) ---------------------- #
+    def to_natural(self) -> "SVINatural":
+        a, b, m, s, r = self.a, self.b, self.m, self.sigma, self.rho
+        root = sqrt(m * m + s * s)
+        return SVINatural(
+            w0=a + b * (root - r * m),
+            w1=b * (r - m / root),
+            w2=b * s * s / root**3,
+            beta_minus=b * (r - 1.0),
+            beta_plus=b * (r + 1.0),
+            T=self.T,
+        )
+
+    # -- no-arbitrage diagnostics -------------------------------------------- #
+    def positivity_conditions(self) -> dict[str, bool]:
+        """Conditions (4.3a)-(4.3d) ensuring w(k) >= 0 everywhere."""
+        _, w_star = self.vertex()
+        return {
+            "sigma>=0": self.sigma >= 0,
+            "b>=0": self.b >= 0,
+            "|rho|<=1": abs(self.rho) <= 1,
+            "w(k*)>=0": w_star >= 0,
+        }
+
+    def durrleman_g(self, k: ArrayLike) -> ArrayLike:
+        """Durrleman butterfly g-function. Butterfly-arbitrage-free iff g(k) >= 0
+        for all k (and w > 0). This is the real test the paper leans on implicitly;
+        it is the practitioner standard, and the one I'd actually gate a slice on."""
+        k = np.asarray(k, dtype=float)
+        w = self.total_variance(k)
+        wp = self.d_dk(k)
+        wpp = self.d2_dk2(k)
+        return (1.0 - k * wp / (2.0 * w)) ** 2 - (wp * wp / 4.0) * (1.0 / w + 0.25) + wpp / 2.0
+
+    def is_butterfly_free(self, k_grid: Optional[ArrayLike] = None) -> bool:
+        if k_grid is None:
+            k_grid = np.linspace(-3.0, 3.0, 2001)
+        w = self.total_variance(k_grid)
+        return bool(np.all(w > 0) and np.all(self.durrleman_g(k_grid) >= -1e-12))
+
+    # -- calibration: quadratic-form regression, Appendix C ------------------ #
+    @classmethod
+    def from_quotes(cls, k: ArrayLike, w: ArrayLike, T: Optional[float] = None) -> "SVIRaw":
+        """Closed-form least-squares calibration (Appendix C).
+
+        Linearizes (2.1) into  c^T x_i = w_i^2  with x_i = [1, k, w, k^2, k*w],
+        solves the linear system for c, then recovers (a,b,m,sigma,rho).
+
+        Caveat (paper's own): this minimizes residuals in w^2-space, not w-space,
+        and is intended only as a *bootstrap* initial guess — not a final fit. Feed
+        the result into a proper nonlinear objective (with the arbitrage penalties).
+        """
+        k = np.asarray(k, dtype=float)
+        w = np.asarray(w, dtype=float)
+        X = np.column_stack([np.ones_like(k), k, w, k * k, k * w])
+        y = w * w
+        c, *_ = np.linalg.lstsq(X, y, rcond=None)
+        c0, c1, c2, c3, c4 = c
+
+        b = 0.5 * sqrt(c4 * c4 + 4.0 * c3)
+        rho = c4 / (2.0 * b)
+        m = -(c1 + 0.5 * c2 * c4) / (2.0 * b * b)
+        a = 0.5 * c2 + b * rho * m
+        sigma = sqrt(c0 + a * a - 2.0 * b * rho * a * m - b * b * (1.0 - rho * rho) * m * m) / abs(b)
+        return cls(a=a, b=b, m=m, sigma=sigma, rho=rho, T=T)
+
+
+# --------------------------------------------------------------------------- #
+# Natural parameterization — Section 3
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SVINatural:
+    """SVI slice in natural parameters (Section 3).
+
+        w0          ATM total variance          w(0)
+        w1          ATM total-variance skew     w'(0)
+        w2          ATM total-variance curvature w''(0)
+        beta_minus  left  (put)  asymptotic slope  lim_{k->-inf} w/k = b(rho-1)
+        beta_plus   right (call) asymptotic slope  lim_{k->+inf} w/k = b(rho+1)
+    """
+
+    w0: float
+    w1: float
+    w2: float
+    beta_minus: float
+    beta_plus: float
+    T: Optional[float] = None
+
+    # -- conversion to raw params, eqs. (2.7)-(2.11) ------------------------- #
+    def to_raw(self) -> SVIRaw:
+        bm, bp = self.beta_minus, self.beta_plus
+        if bp == bm:
+            raise ValueError("beta_plus == beta_minus implies b == 0 (degenerate slice).")
+
+        b = 0.5 * (bp - bm)                       # (2.7)
+        rho = (bp + bm) / (bp - bm)               # (2.8)
+
+        # t := rho - w1/b == m / sqrt(sigma^2 + m^2) in (-1, 1); sign(m) = sign(t)
+        t = rho - self.w1 / b
+        one_m_t2 = 1.0 - t * t
+        if one_m_t2 < 0.0:
+            raise ValueError(
+                f"Inconsistent natural params: (rho - w1/b)^2 = {t*t:.4f} > 1; "
+                "no real raw SVI slice exists."
+            )
+        if self.w2 == 0.0:
+            raise ValueError("w2 == 0 implies infinite sigma (flat curvature is degenerate).")
+
+        sigma = sqrt(b * b * one_m_t2**3 / self.w2**2)          # (2.9)
+        m_abs = sqrt(b * b * one_m_t2**2 * (t * t) / self.w2**2)  # (2.10)
+        m = copysign(m_abs, t)                                   # sign(m) = sign(rho - w1/b)
+
+        a = self.w0 - b * (-rho * m + sqrt(sigma * sigma + m * m))  # (2.11)
+        return SVIRaw(a=a, b=b, m=m, sigma=sigma, rho=rho, T=self.T)
+
+    # convenience pass-throughs
+    def total_variance(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().total_variance(k)
+
+    def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.to_raw().implied_vol(k, T)
+
+    # -- strike-arbitrage equality constraints, eqs. (3.1)-(3.2) ------------- #
+    def strike_arbitrage_residuals(self) -> dict[str, float]:
+        """The paper's *equality* constraints that reduce the 5 DOF to 3:
+            (3.1)  beta_plus = -beta_minus + w1
+            (3.2)  w_tilde   = -4 w0 beta_plus beta_minus / (beta_plus - beta_minus)^2
+        Returns how far the slice sits from each. These are a specific arbitrage-free
+        *construction*, and (as the paper concedes in 4.3/5) they are often too tight
+        to fit market data — in practice you'd relax them to penalties, or just gate
+        on Durrleman g instead. Reported here for completeness, not as a hard filter.
+        """
+        bm, bp = self.beta_minus, self.beta_plus
+        raw = self.to_raw()
+        w_tilde = raw.a + raw.b * raw.sigma * sqrt(1.0 - raw.rho**2)  # root of dw/dk
+        rhs_32 = -4.0 * self.w0 * bp * bm / (bp - bm) ** 2
+        return {
+            "res_3_1": bp - (-bm + self.w1),
+            "res_3_2": w_tilde - rhs_32,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Modified Jump-Wings — a rescaled view of the natural parameters
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SVIModifiedJumpWings:
+    """A practitioner-facing reparametrization of SVINatural.
+
+    The five quoting parameters are linear/affine rescalings of the natural ones
+    (w0, w1, w2, beta_minus, beta_plus), with maturity carried explicitly:
+
+        w0          = atm_vol**2 * T
+        w1          = 2 * atm_skew * sqrt(w0) * 10
+        w2          = atm_conv * 100
+        beta_minus  = left_slope  * sqrt(w0)
+        beta_plus   = right_slope * sqrt(w0)
+
+    Unlike the natural params, atm_vol is an ANNUALIZED VOL and the wing/skew
+    quantities are normalized by sqrt(w0) so they're roughly maturity-stable —
+    this is what makes the family quotable across tenors.
+
+    NOTE on the constant factors. The x10 on skew and x100 on convexity are
+    quoting-unit conventions (e.g. skew per 10% move, convexity in bp-ish units),
+    not anything dictated by SVI itself. They're taken verbatim from your spec; if
+    they ever look off in a fit, this is the first place to check, since they
+    cancel exactly on a round-trip and so won't show up in the assertions below.
+    """
+
+    atm_vol: float      # ATM implied (annualized) Black-Scholes vol
+    atm_skew: float     # ATM skew, in the scaled units above
+    atm_conv: float     # ATM convexity/curvature, scaled
+    left_slope: float   # left (put) wing slope, normalized by sqrt(w0)
+    right_slope: float  # right (call) wing slope, normalized by sqrt(w0)
+    T: float
+
+    def __post_init__(self) -> None:
+        if self.T <= 0:
+            raise ValueError("T must be positive.")
+        if self.atm_vol < 0:
+            raise ValueError("atm_vol must be non-negative.")
+
+    # -- natural quantities (forward map) ------------------------------------ #
+    @property
+    def w0(self) -> float:
+        return self.atm_vol**2 * self.T
+
+    @property
+    def w1(self) -> float:
+        return 2.0 * self.atm_skew * sqrt(self.w0) * 10.0
+
+    @property
+    def w2(self) -> float:
+        return self.atm_conv * 100.0
+
+    @property
+    def beta_minus(self) -> float:
+        return self.left_slope * sqrt(self.w0)
+
+    @property
+    def beta_plus(self) -> float:
+        return self.right_slope * sqrt(self.w0)
+
+    # -- conversions --------------------------------------------------------- #
+    def as_natural(self) -> SVINatural:
+        return SVINatural(
+            w0=self.w0,
+            w1=self.w1,
+            w2=self.w2,
+            beta_minus=self.beta_minus,
+            beta_plus=self.beta_plus,
+            T=self.T,
+        )
+
+    def to_raw(self) -> SVIRaw:
+        return self.as_natural().to_raw()
+
+    @classmethod
+    def from_natural(cls, nat: SVINatural, T: Optional[float] = None) -> "SVIModifiedJumpWings":
+        T = nat.T if T is None else T
+        if T is None or T <= 0:
+            raise ValueError("A positive maturity T is required (pass T or set nat.T).")
+        if nat.w0 <= 0:
+            raise ValueError("w0 must be positive to invert the modified-JW map.")
+        sqrt_w0 = sqrt(nat.w0)
+        return cls(
+            atm_vol=sqrt(nat.w0 / T),
+            atm_skew=nat.w1 / (2.0 * sqrt_w0 * 10.0),
+            atm_conv=nat.w2 / 100.0,
+            left_slope=nat.beta_minus / sqrt_w0,
+            right_slope=nat.beta_plus / sqrt_w0,
+            T=T,
+        )
+
+    @classmethod
+    def from_raw(cls, raw: SVIRaw, T: Optional[float] = None) -> "SVIModifiedJumpWings":
+        return cls.from_natural(raw.to_natural(), T=T if T is not None else raw.T)
+
+    # -- convenience evaluation (delegates to the raw slice) ----------------- #
+    def total_variance(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().total_variance(k)
+
+    def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.to_raw().implied_vol(k, self.T if T is None else T)
+
+
+# --------------------------------------------------------------------------- #
+# Validation
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    np.set_printoptions(precision=6, suppress=True)
+
+    # SX5E-representative ~2Y slice (total variance), arb-free by construction.
+    slice_raw = SVIRaw(a=0.018, b=0.110, m=0.085, sigma=0.190, rho=-0.62, T=2.0)
+    print("Raw slice:        ", slice_raw)
+
+    # 1) Round-trip raw -> natural -> raw -------------------------------------
+    nat = slice_raw.to_natural()
+    back = nat.to_raw()
+    err = max(
+        abs(slice_raw.a - back.a),
+        abs(slice_raw.b - back.b),
+        abs(slice_raw.m - back.m),
+        abs(slice_raw.sigma - back.sigma),
+        abs(slice_raw.rho - back.rho),
+    )
+    print("Natural params:   ", nat)
+    print(f"raw->natural->raw max abs err: {err:.3e}")
+    assert err < 1e-12, "round-trip failed"
+
+    # 2) Round-trip on the curve itself ---------------------------------------
+    ks = np.linspace(-1.0, 1.0, 21)
+    curve_err = np.max(np.abs(slice_raw.total_variance(ks) - back.total_variance(ks)))
+    print(f"total-variance curve max abs err: {curve_err:.3e}")
+
+    # 3) Natural params match their definitions at k=0 ------------------------
+    h = 1e-5
+    w0_fd = slice_raw.total_variance(0.0)
+    w1_fd = (slice_raw.total_variance(h) - slice_raw.total_variance(-h)) / (2 * h)
+    w2_fd = (slice_raw.total_variance(h) - 2 * w0_fd + slice_raw.total_variance(-h)) / h**2
+    print(f"w0  exact/FD: {nat.w0:.8f} / {w0_fd:.8f}")
+    print(f"w1  exact/FD: {nat.w1:.8f} / {w1_fd:.8f}")
+    print(f"w2  exact/FD: {nat.w2:.8f} / {w2_fd:.8f}")
+
+    # 4) No-arbitrage diagnostics ---------------------------------------------
+    print("positivity:       ", slice_raw.positivity_conditions())
+    print("butterfly-free:   ", slice_raw.is_butterfly_free())
+    print("min Durrleman g:  ", float(np.min(slice_raw.durrleman_g(np.linspace(-3, 3, 4001)))))
+    print("strike-arb (eq) residuals:", nat.strike_arbitrage_residuals())
+
+    # 5) Quadratic-form calibration recovers params from noiseless quotes -----
+    k_q = np.linspace(-0.8, 0.8, 25)
+    w_q = slice_raw.total_variance(k_q)
+    fit = SVIRaw.from_quotes(k_q, w_q, T=2.0)
+    fit_err = np.max(np.abs(fit.total_variance(k_q) - w_q))
+    print("calibrated:       ", fit)
+    print(f"quadratic-regression fit max abs err (noiseless): {fit_err:.3e}")
+
+    # vertex
+    print("vertex (k*, w*):  ", slice_raw.vertex())
+
+    # 6) SVIModifiedJumpWings round-trip --------------------------------------
+    mjw = SVIModifiedJumpWings.from_natural(nat)  # T taken from nat.T
+    nat2 = mjw.as_natural()
+    mjw_err = max(
+        abs(nat.w0 - nat2.w0),
+        abs(nat.w1 - nat2.w1),
+        abs(nat.w2 - nat2.w2),
+        abs(nat.beta_minus - nat2.beta_minus),
+        abs(nat.beta_plus - nat2.beta_plus),
+    )
+    print("Modified-JW:      ", mjw)
+    print(f"natural->mod-JW->natural max abs err: {mjw_err:.3e}")
+    assert mjw_err < 1e-12, "modified-JW round-trip failed"
+
+    # full chain raw -> natural -> mod-JW -> raw must match on the curve
+    raw_chain = mjw.to_raw()
+    chain_err = np.max(np.abs(slice_raw.total_variance(ks) - raw_chain.total_variance(ks)))
+    print(f"raw->natural->mod-JW->raw curve max abs err: {chain_err:.3e}")
+    assert chain_err < 1e-12, "modified-JW chain failed"

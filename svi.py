@@ -28,7 +28,7 @@ Dependencies: numpy + stdlib only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import copysign, sqrt
+from math import copysign, pi, sqrt
 from typing import Optional
 
 import numpy as np
@@ -123,6 +123,18 @@ class SVIRaw:
         w = self.total_variance(k_grid)
         return bool(np.all(w > 0) and np.all(self.durrleman_g(k_grid) >= -1e-12))
 
+    def risk_neutral_density(self, k: ArrayLike) -> ArrayLike:
+        """Risk-neutral density in log-moneyness,
+            q(k) = g(k) / sqrt(2 pi w) * exp(-d2^2 / 2),  d2 = -k/sqrt(w) - sqrt(w)/2,
+        with g the Durrleman butterfly function. Integrates to 1 over k for an
+        arbitrage-free slice (g >= 0, w > 0); negative where g < 0 flags butterfly
+        arbitrage. Raw SVI is smooth, so this is exact everywhere (no kink)."""
+        k = np.asarray(k, dtype=float)
+        w = self.total_variance(k)
+        g = self.durrleman_g(k)
+        d2 = -k / np.sqrt(w) - np.sqrt(w) / 2.0
+        return g / np.sqrt(2.0 * pi * w) * np.exp(-d2 * d2 / 2.0)
+
     # -- calibration: quadratic-form regression, Appendix C ------------------ #
     @classmethod
     def from_quotes(cls, k: ArrayLike, w: ArrayLike, T: Optional[float] = None) -> "SVIRaw":
@@ -204,6 +216,12 @@ class SVINatural:
 
     def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
         return self.to_raw().implied_vol(k, T)
+
+    def durrleman_g(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().durrleman_g(k)
+
+    def risk_neutral_density(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().risk_neutral_density(k)
 
     # -- strike-arbitrage equality constraints, eqs. (3.1)-(3.2) ------------- #
     def strike_arbitrage_residuals(self) -> dict[str, float]:
@@ -327,6 +345,12 @@ class SVIModifiedJumpWings:
 
     def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
         return self.to_raw().implied_vol(k, self.T if T is None else T)
+
+    def durrleman_g(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().durrleman_g(k)
+
+    def risk_neutral_density(self, k: ArrayLike) -> ArrayLike:
+        return self.to_raw().risk_neutral_density(k)
 
 
 # --------------------------------------------------------------------------- #

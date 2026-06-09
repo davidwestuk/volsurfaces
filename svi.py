@@ -28,7 +28,7 @@ Dependencies: numpy + stdlib only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import copysign, pi, sqrt
+from math import copysign, erfc, pi, sqrt
 from typing import Optional
 
 import numpy as np
@@ -55,6 +55,36 @@ def logm_to_strike(F: Optional[float], k: ArrayLike) -> ArrayLike:
     if F is None or F <= 0:
         raise ValueError("A positive forward F is required for strike <-> log-moneyness.")
     return F * np.exp(np.asarray(k, dtype=float))
+
+
+# Vectorized standard-normal CDF via stdlib erf (keeps numpy + stdlib only; no scipy).
+_norm_cdf = np.vectorize(lambda x: 0.5 * erfc(-x / sqrt(2.0)), otypes=[float])
+
+
+def black_price(F: float, K: ArrayLike, w: ArrayLike, kind: str = "call") -> ArrayLike:
+    """Undiscounted (forward) Black-76 option price.
+
+    Parameterized by TOTAL variance w = sigma^2 * T rather than (sigma, T), so the
+    maturity cancels — this is what the SVI slices hand back directly. With
+        d1 = (log(F/K) + w/2) / sqrt(w),   d2 = d1 - sqrt(w),
+        call = F N(d1) - K N(d2),   put = K N(-d2) - F N(-d1).
+    For w <= 0 the price degenerates to intrinsic (forward) value.
+    """
+    F = float(F)
+    K = np.asarray(K, dtype=float)
+    w = np.asarray(w, dtype=float)
+    sw = np.sqrt(np.maximum(w, 0.0))
+    intrinsic = np.maximum(F - K, 0.0) if kind == "call" else np.maximum(K - F, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(F / K) + 0.5 * w) / sw
+        d2 = d1 - sw
+        if kind == "call":
+            price = F * _norm_cdf(d1) - K * _norm_cdf(d2)
+        elif kind == "put":
+            price = K * _norm_cdf(-d2) - F * _norm_cdf(-d1)
+        else:
+            raise ValueError("kind must be 'call' or 'put'.")
+    return np.where(sw > 0.0, price, intrinsic)
 
 
 # --------------------------------------------------------------------------- #
@@ -440,6 +470,56 @@ class SVIModifiedJumpWings:
 
 
 # --------------------------------------------------------------------------- #
+# Variance-swap fair strike via option replication
+# --------------------------------------------------------------------------- #
+def variance_swap_strike(
+    slice,
+    *,
+    k_min: float = -10.0,
+    k_max: float = 10.0,
+    num: int = 4001,
+    F: Optional[float] = None,
+    T: Optional[float] = None,
+) -> float:
+    """Fair variance-swap strike of a single smile slice, in vol points
+    (e.g. 0.20 = 20 vol). Returns K_var = sqrt(annualized fair variance).
+
+    Model-free Carr-Madan / Demeterfi-Derman-Kamani-Zou replication of the log
+    contract, split at the forward K = F so the boundary correction term vanishes:
+
+        K_var^2 * T = 2 [ int_{K<F} P(K)/K^2 dK + int_{K>F} C(K)/K^2 dK ]
+
+    Computed in log-moneyness k = log(K/F) (K = F e^k, dK = K dk):
+
+        K_var^2 * T = 2 int  price_OTM(k) / (F e^k) dk,
+
+    with price_OTM = put for k < 0, call for k >= 0 (continuous at the forward).
+    Option prices are Black-76 values of the slice's own implied vols, so the
+    result reflects the actual smile -- including any kink (e.g. IVP), which a
+    smooth-density estimate would miss.
+
+    Works on any slice exposing `total_variance(k)`, `.F` and `.T` (all five
+    SVI/IVP classes do); the IVP classes return their realized/damped smile.
+
+    NOTE: the fair variance is wing-sensitive. The default grid spans roughly
+    e^{+-10} in strike; widen [k_min, k_max] or raise `num` for very steep wings.
+    """
+    F = slice.F if F is None else F
+    if F is None or F <= 0:
+        raise ValueError("A positive forward F is required (set slice.F or pass F).")
+    T = slice.T if T is None else T
+    if T is None or T <= 0:
+        raise ValueError("A positive maturity T is required (set slice.T or pass T).")
+
+    k = np.linspace(k_min, k_max, num)
+    w = np.asarray(slice.total_variance(k), dtype=float)
+    K = F * np.exp(k)
+    otm = np.where(k < 0.0, black_price(F, K, w, "put"), black_price(F, K, w, "call"))
+    integral = np.trapezoid(otm / K, k)  # = int price/K^2 dK
+    return float(sqrt(2.0 * integral / T))
+
+
+# --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -533,3 +613,24 @@ if __name__ == "__main__":
     integral_K = np.trapezoid(slice_F.risk_neutral_density_strike(Kgrid), Kgrid)
     print(f"strike-space density integral over K: {integral_K:.4f}")
     assert abs(integral_K - 1.0) < 1e-3, "strike-space density must integrate to 1"
+
+    # 8) Variance-swap fair strike (option replication) ----------------------
+    # (a) flat smile (b=0) must replicate vol exactly: K_var == sigma
+    sigma_flat, T_flat = 0.20, 1.5
+    flat = SVIRaw(a=sigma_flat**2 * T_flat, b=0.0, m=0.0, sigma=0.0, rho=0.0, T=T_flat, F=100.0)
+    kvar_flat = variance_swap_strike(flat)
+    print(f"\nflat-vol slice: K_var={kvar_flat:.6f}  (sigma={sigma_flat})")
+    assert abs(kvar_flat - sigma_flat) < 1e-4, "flat-vol variance swap must equal sigma"
+
+    # (b) replication must match the density route -2 E[k]/T on the smooth slice
+    kvar = variance_swap_strike(slice_F)
+    kk = np.linspace(-12.0, 12.0, 200001)
+    Ek = np.trapezoid(kk * slice_F.risk_neutral_density(kk), kk)
+    kvar_density = sqrt(-2.0 * Ek / slice_F.T)
+    print(f"SX5E slice: K_var (replication)={kvar:.6f}  (density -2E[k]/T)={kvar_density:.6f}")
+    assert abs(kvar - kvar_density) < 1e-3, "replication vs density route mismatch"
+
+    # (c) convexity premium: variance-swap strike >= ATM vol for a skewed smile
+    atm_vol = float(slice_F.implied_vol_strike(slice_F.F))
+    print(f"K_var={kvar:.6f}  ATM vol={atm_vol:.6f}  (premium={kvar - atm_vol:+.6f})")
+    assert kvar >= atm_vol, "variance-swap strike should exceed ATM vol under skew/convexity"

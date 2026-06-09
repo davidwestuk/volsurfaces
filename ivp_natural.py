@@ -44,7 +44,13 @@ from typing import Optional
 
 import numpy as np
 
-from svi import SVINatural, SVIRaw, forward_to_logm, logm_to_strike  # <-- adjust to your module name
+from svi import (  # <-- adjust to your module name
+    SVINatural,
+    SVIRaw,
+    forward_to_logm,
+    logm_to_strike,
+    variance_swap_strike,
+)
 
 ArrayLike = np.ndarray
 
@@ -436,3 +442,10 @@ if __name__ == "__main__":
     Kgrid = np.linspace(1.0, 1000.0, 400001)
     integral_K = np.trapezoid(ivp_F.risk_neutral_density_strike(Kgrid), Kgrid)
     print(f"F={F}: strike-space density integral over K: {integral_K:.4f}")
+
+    # variance-swap fair strike on the damped IVP slice (replication prices the
+    # realized smile, so the kink is captured exactly -- no point-mass error)
+    kvar = variance_swap_strike(ivp_F)
+    kvar_fine = variance_swap_strike(ivp_F, num=8001)
+    print(f"F={F}: variance-swap strike K_var={kvar:.6f}  (grid-stable: {abs(kvar - kvar_fine):.2e})")
+    assert kvar > 0.0 and abs(kvar - kvar_fine) < 1e-3, "IVP variance swap unstable"

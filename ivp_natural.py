@@ -44,7 +44,7 @@ from typing import Optional
 
 import numpy as np
 
-from svi import SVINatural, SVIRaw  # <-- adjust to your module name
+from svi import SVINatural, SVIRaw, forward_to_logm, logm_to_strike  # <-- adjust to your module name
 
 ArrayLike = np.ndarray
 
@@ -108,6 +108,7 @@ class IVPNatural:
     beta_plus: float
     beta_g: float = 1.0
     T: Optional[float] = None
+    F: Optional[float] = None  # forward, only needed for strike-based methods
 
     _MAXIT = 200
     _TOL = 1e-14
@@ -127,7 +128,7 @@ class IVPNatural:
 
         # beta = 1: the realized jet IS the raw jet -> plain SVINatural.
         if beta == 1.0:
-            return SVINatural(self.w0, self.w1, self.w2, bm, bp, self.T).to_raw()
+            return SVINatural(self.w0, self.w1, self.w2, bm, bp, self.T, self.F).to_raw()
 
         L = log(beta)
 
@@ -167,7 +168,7 @@ class IVPNatural:
         am, sm = abs(m), copysign(1.0, m)
         W1 = self.w1 * beta ** (1.0 + 4.0 * am)
         W2 = (self.w2 - 8.0 * L * sm * self.w1) * beta ** (2.0 + 8.0 * am)
-        return SVINatural(self.w0, W1, W2, bm, bp, self.T).to_raw()
+        return SVINatural(self.w0, W1, W2, bm, bp, self.T, self.F).to_raw()
 
     # -- realized-smile evaluation (IVP transform) -------------------------- #
     def total_variance(self, k: ArrayLike) -> ArrayLike:
@@ -216,6 +217,26 @@ class IVPNatural:
         d2 = -k / np.sqrt(w) - np.sqrt(w) / 2.0
         return g / np.sqrt(2.0 * math.pi * w) * np.exp(-d2**2 / 2.0)
 
+    # -- strike <-> log-moneyness, strike-space evaluation ------------------- #
+    # These route through the realized (damped) IVP smile, not the skeleton.
+    def log_moneyness(self, K: ArrayLike) -> ArrayLike:
+        return forward_to_logm(self.F, K)
+
+    def strike(self, k: ArrayLike) -> ArrayLike:
+        return logm_to_strike(self.F, k)
+
+    def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.total_variance(self.log_moneyness(K))
+
+    def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.implied_vol(self.log_moneyness(K), T)
+
+    def risk_neutral_density_strike(self, K: ArrayLike):
+        """Density in strike space, q_K(K) = q_k(log(K/F)) / K. Same kink caveat as
+        risk_neutral_density: the point mass at the vertex k = m is not captured."""
+        K = np.asarray(K, dtype=float)
+        return self.risk_neutral_density(self.log_moneyness(K)) / K
+
     # -- build from a known skeleton (handy for tests / seeding) ------------ #
     @classmethod
     def from_raw(cls, raw: SVIRaw, beta_g: float, T: Optional[float] = None) -> "IVPNatural":
@@ -224,7 +245,7 @@ class IVPNatural:
         return cls(
             w0=float(w.item()), w1=float(wp.item()), w2=float(wpp.item()),
             beta_minus=b * (rho - 1.0), beta_plus=b * (rho + 1.0),
-            beta_g=beta_g, T=raw.T if T is None else T,
+            beta_g=beta_g, T=raw.T if T is None else T, F=raw.F,
         )
 
 
@@ -266,6 +287,7 @@ class IVPModifiedJumpWings:
     right_slope: float
     T: float
     beta_g: float = 1.0
+    F: Optional[float] = None  # forward, only needed for strike-based methods
 
     def __post_init__(self) -> None:
         if self.T <= 0:
@@ -301,7 +323,7 @@ class IVPModifiedJumpWings:
         return IVPNatural(
             w0=self.w0, w1=self.w1, w2=self.w2,
             beta_minus=self.beta_minus, beta_plus=self.beta_plus,
-            beta_g=self.beta_g, T=self.T,
+            beta_g=self.beta_g, T=self.T, F=self.F,
         )
 
     def to_raw(self) -> SVIRaw:
@@ -309,7 +331,9 @@ class IVPModifiedJumpWings:
         return self.as_natural().to_raw()
 
     @classmethod
-    def from_natural(cls, nat: IVPNatural, T: Optional[float] = None) -> "IVPModifiedJumpWings":
+    def from_natural(
+        cls, nat: IVPNatural, T: Optional[float] = None, F: Optional[float] = None
+    ) -> "IVPModifiedJumpWings":
         T = nat.T if T is None else T
         if T is None or T <= 0:
             raise ValueError("A positive maturity T is required (pass T or set nat.T).")
@@ -324,6 +348,7 @@ class IVPModifiedJumpWings:
             right_slope=nat.beta_plus / sqrt_w0,
             T=T,
             beta_g=nat.beta_g,
+            F=nat.F if F is None else F,
         )
 
     @classmethod
@@ -350,6 +375,21 @@ class IVPModifiedJumpWings:
 
     def risk_neutral_density(self, k: ArrayLike):
         return self.as_natural().risk_neutral_density(k)
+
+    def log_moneyness(self, K: ArrayLike) -> ArrayLike:
+        return forward_to_logm(self.F, K)
+
+    def strike(self, k: ArrayLike) -> ArrayLike:
+        return logm_to_strike(self.F, k)
+
+    def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.as_natural().total_variance_strike(K)
+
+    def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.as_natural().implied_vol_strike(K, self.T if T is None else T)
+
+    def risk_neutral_density_strike(self, K: ArrayLike):
+        return self.as_natural().risk_neutral_density_strike(K)
 
 
 # --------------------------------------------------------------------------- #
@@ -380,3 +420,19 @@ if __name__ == "__main__":
     integral = np.trapezoid(ivp.risk_neutral_density(k), k)
     print(f"\nbeta_g=1.3 density integral: {integral:.4f}")
     print(f"butterfly-free (away from vertex): {ivp.is_butterfly_free()}")
+
+    # forward F: strike-based eval on the realized (damped) IVP smile ---------
+    F = 100.0
+    skel_F = SVIRaw(a=0.04, b=0.40, m=0.05, sigma=0.10, rho=-0.40, T=1.0, F=F)
+    ivp_F = IVPNatural.from_raw(skel_F, beta_g=1.3, T=1.0)
+    assert ivp_F.F == F and ivp_F.to_raw().F == F  # F carried through the solve
+    assert IVPModifiedJumpWings.from_natural(ivp_F).F == F
+    K = np.array([80.0, 100.0, 125.0])
+    km = ivp_F.log_moneyness(K)
+    assert np.max(np.abs(ivp_F.strike(km) - K)) < 1e-9
+    # strike-space eval = realized (damped) smile, NOT the skeleton
+    assert np.max(np.abs(ivp_F.total_variance_strike(K) - ivp_F.total_variance(km))) < 1e-12
+    print(f"\nF={F}: ATM (K=F) implied vol: {float(ivp_F.implied_vol_strike(F)):.6f}")
+    Kgrid = np.linspace(1.0, 1000.0, 400001)
+    integral_K = np.trapezoid(ivp_F.risk_neutral_density_strike(Kgrid), Kgrid)
+    print(f"F={F}: strike-space density integral over K: {integral_K:.4f}")

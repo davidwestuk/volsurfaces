@@ -37,6 +37,27 @@ ArrayLike = np.ndarray
 
 
 # --------------------------------------------------------------------------- #
+# Forward / strike helpers
+# --------------------------------------------------------------------------- #
+# Every parameterization works internally in log-moneyness k = log(K / F), where
+# F is the forward. Carrying F on a slice is what lets it speak in strikes K and
+# report the risk-neutral density in strike space. F is optional: leave it None
+# and the k-based API is unchanged; set it to use the *_strike helpers.
+def forward_to_logm(F: Optional[float], K: ArrayLike) -> ArrayLike:
+    """k = log(K / F)."""
+    if F is None or F <= 0:
+        raise ValueError("A positive forward F is required for strike <-> log-moneyness.")
+    return np.log(np.asarray(K, dtype=float) / F)
+
+
+def logm_to_strike(F: Optional[float], k: ArrayLike) -> ArrayLike:
+    """K = F * exp(k)."""
+    if F is None or F <= 0:
+        raise ValueError("A positive forward F is required for strike <-> log-moneyness.")
+    return F * np.exp(np.asarray(k, dtype=float))
+
+
+# --------------------------------------------------------------------------- #
 # Raw (original) parameterization — eq. (2.1)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -52,6 +73,7 @@ class SVIRaw:
     sigma: float
     rho: float
     T: Optional[float] = None  # maturity, only needed for vol conversion
+    F: Optional[float] = None  # forward, only needed for strike-based methods
 
     # -- evaluation ---------------------------------------------------------- #
     def total_variance(self, k: ArrayLike) -> ArrayLike:
@@ -94,7 +116,29 @@ class SVIRaw:
             beta_minus=b * (r - 1.0),
             beta_plus=b * (r + 1.0),
             T=self.T,
+            F=self.F,
         )
+
+    # -- strike <-> log-moneyness, strike-space evaluation ------------------- #
+    def log_moneyness(self, K: ArrayLike) -> ArrayLike:
+        """k = log(K / F)."""
+        return forward_to_logm(self.F, K)
+
+    def strike(self, k: ArrayLike) -> ArrayLike:
+        """K = F * exp(k)."""
+        return logm_to_strike(self.F, k)
+
+    def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.total_variance(self.log_moneyness(K))
+
+    def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.implied_vol(self.log_moneyness(K), T)
+
+    def risk_neutral_density_strike(self, K: ArrayLike) -> ArrayLike:
+        """Density in strike space, q_K(K) = q_k(log(K/F)) / K (change of variables
+        k = log(K/F), dk/dK = 1/K). Integrates to 1 over K for an arb-free slice."""
+        K = np.asarray(K, dtype=float)
+        return self.risk_neutral_density(self.log_moneyness(K)) / K
 
     # -- no-arbitrage diagnostics -------------------------------------------- #
     def positivity_conditions(self) -> dict[str, bool]:
@@ -137,7 +181,9 @@ class SVIRaw:
 
     # -- calibration: quadratic-form regression, Appendix C ------------------ #
     @classmethod
-    def from_quotes(cls, k: ArrayLike, w: ArrayLike, T: Optional[float] = None) -> "SVIRaw":
+    def from_quotes(
+        cls, k: ArrayLike, w: ArrayLike, T: Optional[float] = None, F: Optional[float] = None
+    ) -> "SVIRaw":
         """Closed-form least-squares calibration (Appendix C).
 
         Linearizes (2.1) into  c^T x_i = w_i^2  with x_i = [1, k, w, k^2, k*w],
@@ -159,7 +205,7 @@ class SVIRaw:
         m = -(c1 + 0.5 * c2 * c4) / (2.0 * b * b)
         a = 0.5 * c2 + b * rho * m
         sigma = sqrt(c0 + a * a - 2.0 * b * rho * a * m - b * b * (1.0 - rho * rho) * m * m) / abs(b)
-        return cls(a=a, b=b, m=m, sigma=sigma, rho=rho, T=T)
+        return cls(a=a, b=b, m=m, sigma=sigma, rho=rho, T=T, F=F)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +228,7 @@ class SVINatural:
     beta_minus: float
     beta_plus: float
     T: Optional[float] = None
+    F: Optional[float] = None
 
     # -- conversion to raw params, eqs. (2.7)-(2.11) ------------------------- #
     def to_raw(self) -> SVIRaw:
@@ -208,7 +255,7 @@ class SVINatural:
         m = copysign(m_abs, t)                                   # sign(m) = sign(rho - w1/b)
 
         a = self.w0 - b * (-rho * m + sqrt(sigma * sigma + m * m))  # (2.11)
-        return SVIRaw(a=a, b=b, m=m, sigma=sigma, rho=rho, T=self.T)
+        return SVIRaw(a=a, b=b, m=m, sigma=sigma, rho=rho, T=self.T, F=self.F)
 
     # convenience pass-throughs
     def total_variance(self, k: ArrayLike) -> ArrayLike:
@@ -222,6 +269,21 @@ class SVINatural:
 
     def risk_neutral_density(self, k: ArrayLike) -> ArrayLike:
         return self.to_raw().risk_neutral_density(k)
+
+    def log_moneyness(self, K: ArrayLike) -> ArrayLike:
+        return forward_to_logm(self.F, K)
+
+    def strike(self, k: ArrayLike) -> ArrayLike:
+        return logm_to_strike(self.F, k)
+
+    def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.to_raw().total_variance_strike(K)
+
+    def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.to_raw().implied_vol_strike(K, T)
+
+    def risk_neutral_density_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.to_raw().risk_neutral_density_strike(K)
 
     # -- strike-arbitrage equality constraints, eqs. (3.1)-(3.2) ------------- #
     def strike_arbitrage_residuals(self) -> dict[str, float]:
@@ -276,6 +338,7 @@ class SVIModifiedJumpWings:
     left_slope: float   # left (put) wing slope, normalized by sqrt(w0)
     right_slope: float  # right (call) wing slope, normalized by sqrt(w0)
     T: float
+    F: Optional[float] = None  # forward, only needed for strike-based methods
 
     def __post_init__(self) -> None:
         if self.T <= 0:
@@ -313,13 +376,16 @@ class SVIModifiedJumpWings:
             beta_minus=self.beta_minus,
             beta_plus=self.beta_plus,
             T=self.T,
+            F=self.F,
         )
 
     def to_raw(self) -> SVIRaw:
         return self.as_natural().to_raw()
 
     @classmethod
-    def from_natural(cls, nat: SVINatural, T: Optional[float] = None) -> "SVIModifiedJumpWings":
+    def from_natural(
+        cls, nat: SVINatural, T: Optional[float] = None, F: Optional[float] = None
+    ) -> "SVIModifiedJumpWings":
         T = nat.T if T is None else T
         if T is None or T <= 0:
             raise ValueError("A positive maturity T is required (pass T or set nat.T).")
@@ -333,11 +399,16 @@ class SVIModifiedJumpWings:
             left_slope=nat.beta_minus / sqrt_w0,
             right_slope=nat.beta_plus / sqrt_w0,
             T=T,
+            F=nat.F if F is None else F,
         )
 
     @classmethod
-    def from_raw(cls, raw: SVIRaw, T: Optional[float] = None) -> "SVIModifiedJumpWings":
-        return cls.from_natural(raw.to_natural(), T=T if T is not None else raw.T)
+    def from_raw(
+        cls, raw: SVIRaw, T: Optional[float] = None, F: Optional[float] = None
+    ) -> "SVIModifiedJumpWings":
+        return cls.from_natural(
+            raw.to_natural(), T=T if T is not None else raw.T, F=F if F is not None else raw.F
+        )
 
     # -- convenience evaluation (delegates to the raw slice) ----------------- #
     def total_variance(self, k: ArrayLike) -> ArrayLike:
@@ -351,6 +422,21 @@ class SVIModifiedJumpWings:
 
     def risk_neutral_density(self, k: ArrayLike) -> ArrayLike:
         return self.to_raw().risk_neutral_density(k)
+
+    def log_moneyness(self, K: ArrayLike) -> ArrayLike:
+        return forward_to_logm(self.F, K)
+
+    def strike(self, k: ArrayLike) -> ArrayLike:
+        return logm_to_strike(self.F, k)
+
+    def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.to_raw().total_variance_strike(K)
+
+    def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
+        return self.to_raw().implied_vol_strike(K, self.T if T is None else T)
+
+    def risk_neutral_density_strike(self, K: ArrayLike) -> ArrayLike:
+        return self.to_raw().risk_neutral_density_strike(K)
 
 
 # --------------------------------------------------------------------------- #
@@ -427,3 +513,23 @@ if __name__ == "__main__":
     chain_err = np.max(np.abs(slice_raw.total_variance(ks) - raw_chain.total_variance(ks)))
     print(f"raw->natural->mod-JW->raw curve max abs err: {chain_err:.3e}")
     assert chain_err < 1e-12, "modified-JW chain failed"
+
+    # 7) Forward F: strike-based evaluation + density in strike space ---------
+    F = 4200.0
+    slice_F = SVIRaw(a=0.018, b=0.110, m=0.085, sigma=0.190, rho=-0.62, T=2.0, F=F)
+    # F is carried through every conversion
+    assert slice_F.to_natural().to_raw().F == F
+    assert SVIModifiedJumpWings.from_raw(slice_F).F == F
+    # strike <-> log-moneyness round-trip
+    K = np.array([3000.0, 4200.0, 5400.0])
+    km = slice_F.log_moneyness(K)
+    print("\nlog-moneyness of strikes:", km)
+    assert np.max(np.abs(slice_F.strike(km) - K)) < 1e-9
+    # strike-space evaluation matches k-space evaluation
+    assert np.max(np.abs(slice_F.total_variance_strike(K) - slice_F.total_variance(km))) < 1e-12
+    print("ATM (K=F) implied vol:   ", float(slice_F.implied_vol_strike(F)))
+    # density in strike space integrates to 1 over K
+    Kgrid = np.linspace(500.0, 30000.0, 400001)
+    integral_K = np.trapezoid(slice_F.risk_neutral_density_strike(Kgrid), Kgrid)
+    print(f"strike-space density integral over K: {integral_K:.4f}")
+    assert abs(integral_K - 1.0) < 1e-3, "strike-space density must integrate to 1"

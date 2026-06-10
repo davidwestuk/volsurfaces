@@ -42,18 +42,29 @@ ArrayLike = np.ndarray
 # Every parameterization works internally in log-moneyness k = log(K / F), where
 # F is the forward. Carrying F on a slice is what lets it speak in strikes K and
 # report the risk-neutral density in strike space. F is optional: leave it None
-# and the k-based API is unchanged; set it to use the *_strike helpers.
+# and the k-based API is unchanged; set it to use the *_strike helpers. When F is
+# unset, every strike-space call raises ValueError, so a missing forward can never
+# silently produce a wrong number.
+def _require_forward(F: Optional[float], detail: str = "for strike-space methods") -> float:
+    """Validate and return a positive forward, or raise a clear ValueError.
+
+    Centralizes the guard used by every strike-space entry point so the
+    k-space API stays F-free while strike-space calls fail fast and uniformly.
+    """
+    if F is None or F <= 0:
+        raise ValueError(f"A positive forward F is required {detail}.")
+    return float(F)
+
+
 def forward_to_logm(F: Optional[float], K: ArrayLike) -> ArrayLike:
     """k = log(K / F)."""
-    if F is None or F <= 0:
-        raise ValueError("A positive forward F is required for strike <-> log-moneyness.")
+    F = _require_forward(F, "for strike <-> log-moneyness")
     return np.log(np.asarray(K, dtype=float) / F)
 
 
 def logm_to_strike(F: Optional[float], k: ArrayLike) -> ArrayLike:
     """K = F * exp(k)."""
-    if F is None or F <= 0:
-        raise ValueError("A positive forward F is required for strike <-> log-moneyness.")
+    F = _require_forward(F, "for strike <-> log-moneyness")
     return F * np.exp(np.asarray(k, dtype=float))
 
 
@@ -504,9 +515,7 @@ def variance_swap_strike(
     NOTE: the fair variance is wing-sensitive. The default grid spans roughly
     e^{+-10} in strike; widen [k_min, k_max] or raise `num` for very steep wings.
     """
-    F = slice.F if F is None else F
-    if F is None or F <= 0:
-        raise ValueError("A positive forward F is required (set slice.F or pass F).")
+    F = _require_forward(slice.F if F is None else F, "(set slice.F or pass F)")
     T = slice.T if T is None else T
     if T is None or T <= 0:
         raise ValueError("A positive maturity T is required (set slice.T or pass T).")
@@ -544,9 +553,7 @@ def prob_below_strike(
     Works on any slice exposing `total_variance(k)` and `.F` (all five SVI/IVP
     classes); the IVP classes use their realized/damped smile. `T` is not needed.
     """
-    F = slice.F if F is None else F
-    if F is None or F <= 0:
-        raise ValueError("A positive forward F is required (set slice.F or pass F).")
+    F = _require_forward(slice.F if F is None else F, "(set slice.F or pass F)")
     K = float(K)
     if K <= 0:
         raise ValueError("Strike K must be positive.")

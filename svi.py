@@ -523,7 +523,12 @@ def variance_swap_strike(
     k = np.linspace(k_min, k_max, num)
     w = np.asarray(slice.total_variance(k), dtype=float)
     K = F * np.exp(k)
-    otm = np.where(k < 0.0, black_price(F, K, w, "put"), black_price(F, K, w, "call"))
+    # Price each strike once on its OTM side (put for k < 0, call for k >= 0);
+    # at k = 0 (K = F) put and call coincide, so the split point is irrelevant.
+    otm = np.empty_like(k)
+    left = k < 0.0
+    otm[left] = black_price(F, K[left], w[left], "put")
+    otm[~left] = black_price(F, K[~left], w[~left], "call")
     integral = np.trapezoid(otm / K, k)  # = int price/K^2 dK
     return float(sqrt(2.0 * integral / T))
 

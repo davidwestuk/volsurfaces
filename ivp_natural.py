@@ -39,6 +39,7 @@ Reuses SVIRaw / SVINatural from your module -- adjust the import to its filename
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from math import copysign, log, sqrt
 from typing import Optional
 
@@ -125,7 +126,17 @@ class IVPNatural:
             raise ValueError("beta_g must be >= 1 (beta_g = 1 is plain SVINatural)")
 
     # -- core: recover the raw skeleton ------------------------------------- #
+    @cached_property
+    def _raw(self) -> SVIRaw:
+        # Frozen, immutable slice: the fixed-point solve is pure, so cache it.
+        # cached_property writes through instance.__dict__, bypassing the frozen
+        # __setattr__; the result is one solve per instance.
+        return self._solve_raw()
+
     def to_raw(self) -> SVIRaw:
+        return self._raw
+
+    def _solve_raw(self) -> SVIRaw:
         bm, bp = self.beta_minus, self.beta_plus
         if bp == bm:
             raise ValueError("beta_plus == beta_minus implies b == 0 (degenerate slice).")
@@ -326,7 +337,10 @@ class IVPModifiedJumpWings:
         return self.right_slope * sqrt(self.w0)
 
     # -- conversions -------------------------------------------------------- #
+    @cached_property
     def as_natural(self) -> IVPNatural:
+        # Cached so all evaluation methods share one IVPNatural (hence one solve)
+        # per frozen, immutable IVPModifiedJumpWings instance.
         return IVPNatural(
             w0=self.w0, w1=self.w1, w2=self.w2,
             beta_minus=self.beta_minus, beta_plus=self.beta_plus,
@@ -335,7 +349,7 @@ class IVPModifiedJumpWings:
 
     def to_raw(self) -> SVIRaw:
         """The raw SKELETON (undamped). Use total_variance() for the damped smile."""
-        return self.as_natural().to_raw()
+        return self.as_natural.to_raw()
 
     @classmethod
     def from_natural(
@@ -366,22 +380,22 @@ class IVPModifiedJumpWings:
 
     # -- evaluation = realized (damped) smile, via the IVP transform -------- #
     def total_variance(self, k: ArrayLike) -> ArrayLike:
-        return self.as_natural().total_variance(k)
+        return self.as_natural.total_variance(k)
 
     def implied_vol(self, k: ArrayLike, T: Optional[float] = None) -> ArrayLike:
-        return self.as_natural().implied_vol(k, self.T if T is None else T)
+        return self.as_natural.implied_vol(k, self.T if T is None else T)
 
     def d_dk(self, k: ArrayLike) -> ArrayLike:
-        return self.as_natural().d_dk(k)
+        return self.as_natural.d_dk(k)
 
     def d2_dk2(self, k: ArrayLike) -> ArrayLike:
-        return self.as_natural().d2_dk2(k)
+        return self.as_natural.d2_dk2(k)
 
     def durrleman_g(self, k: ArrayLike) -> ArrayLike:
-        return self.as_natural().durrleman_g(k)
+        return self.as_natural.durrleman_g(k)
 
     def risk_neutral_density(self, k: ArrayLike):
-        return self.as_natural().risk_neutral_density(k)
+        return self.as_natural.risk_neutral_density(k)
 
     def log_moneyness(self, K: ArrayLike) -> ArrayLike:
         return forward_to_logm(self.F, K)
@@ -390,13 +404,13 @@ class IVPModifiedJumpWings:
         return logm_to_strike(self.F, k)
 
     def total_variance_strike(self, K: ArrayLike) -> ArrayLike:
-        return self.as_natural().total_variance_strike(K)
+        return self.as_natural.total_variance_strike(K)
 
     def implied_vol_strike(self, K: ArrayLike, T: Optional[float] = None) -> ArrayLike:
-        return self.as_natural().implied_vol_strike(K, self.T if T is None else T)
+        return self.as_natural.implied_vol_strike(K, self.T if T is None else T)
 
     def risk_neutral_density_strike(self, K: ArrayLike):
-        return self.as_natural().risk_neutral_density_strike(K)
+        return self.as_natural.risk_neutral_density_strike(K)
 
 
 # --------------------------------------------------------------------------- #
